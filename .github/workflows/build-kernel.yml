@@ -1,0 +1,234 @@
+name: 🔧 Build KernelSU Next Kernel (bramble)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "GitHubリリースとして公開する"
+        required: true
+        default: false
+        type: boolean
+  push:
+    branches: [ main ]
+    paths:
+      - 'patches/**'
+      - 'anykernel3/**'
+      - '.github/workflows/build-kernel.yml'
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      # ─────────────────────────────────────────
+      # 1. ディスク空き容量を確保（必須！）
+      # ─────────────────────────────────────────
+      - name: 💽 Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      # ─────────────────────────────────────────
+      # 2. このリポジトリをチェックアウト
+      # ─────────────────────────────────────────
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      # 3. 必要パッケージのインストール
+      # ─────────────────────────────────────────
+      - name: 📦 Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            git git-lfs gnupg gperf libelf-dev libssl-dev \
+            libxml2-utils lz4 lzop python3 rsync zip unzip \
+            zlib1g-dev cpio libarchive-tools
+
+      # ─────────────────────────────────────────
+      # 4. Clangツールチェーンの取得
+      #    (Proton Clang - Kernel 4.19対応)
+      # ─────────────────────────────────────────
+      - name: 🛠️ Download Proton Clang Toolchain
+        run: |
+          mkdir -p $HOME/toolchain/clang
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang.git \
+            $HOME/toolchain/clang
+          echo "CLANG_PATH=$HOME/toolchain/clang/bin" >> $GITHUB_ENV
+          echo "PATH=$HOME/toolchain/clang/bin:$PATH" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────
+      # 5. カーネルソースのクローン
+      #    (LineageOS 23.2 redbull/bramble共通カーネル)
+      # ─────────────────────────────────────────
+      - name: 📂 Clone Kernel Source (LineageOS 23.2)
+        run: |
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_kernel_google_redbull.git \
+            -b lineage-23.2 \
+            $HOME/kernel/bramble
+          echo "KERNEL_DIR=$HOME/kernel/bramble" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────
+      # 6. KernelSU Next の追加
+      # ─────────────────────────────────────────
+      - name: ⚡ Integrate KernelSU Next
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s next
+          # drivers/Kconfig に追加
+          if ! grep -q 'kernelsu/Kconfig' drivers/Kconfig; then
+            echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+          fi
+          # drivers/Makefile に追加
+          if ! grep -q 'obj-$(CONFIG_KSU)' drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+
+      # ─────────────────────────────────────────
+      # 7. 手動フックパッチの適用
+      # ─────────────────────────────────────────
+      - name: 🔩 Apply Manual Hook Patches
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          # パッチファイルをコピー
+          cp $GITHUB_WORKSPACE/patches/*.patch ./
+
+          # 各パッチを適用（エラー時は --reject で強制適用）
+          for p in exec.patch open.patch read_write.patch stat.patch input.patch devpts.patch; do
+            echo "==> Applying $p ..."
+            patch -p1 --no-backup-if-mismatch < "$p" || \
+            patch -p1 --no-backup-if-mismatch --reject-file=- < "$p" || \
+            echo "WARNING: $p had rejected hunks - check manually"
+          done
+
+      # ─────────────────────────────────────────
+      # 8. defconfig の生成と KSU 設定の有効化
+      # ─────────────────────────────────────────
+      - name: ⚙️ Configure Kernel (defconfig)
+        working-directory: ${{ env.KERNEL_DIR }}
+        env:
+          PATH: ${{ env.CLANG_PATH }}:$PATH
+        run: |
+          export PATH=$HOME/toolchain/clang/bin:$PATH
+          make O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            redbull_defconfig
+
+          # KernelSU Next の設定を有効化
+          scripts/config \
+            --file out/.config \
+            -e CONFIG_KSU \
+            -e CONFIG_KSU_MANUAL_HOOK \
+            -d CONFIG_KPROBES \
+            -e CONFIG_OVERLAY_FS
+
+          # 設定の確認
+          echo "=== KSU Config Check ==="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY" out/.config || true
+
+      # ─────────────────────────────────────────
+      # 9. カーネルのビルド
+      # ─────────────────────────────────────────
+      - name: 🏗️ Build Kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          export PATH=$HOME/toolchain/clang/bin:$PATH
+          make -j$(nproc --all) \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            2>&1 | tee $HOME/build.log
+
+          # ビルド成果物の確認
+          echo "=== Build Outputs ==="
+          ls -lh out/arch/arm64/boot/ || true
+
+      # ─────────────────────────────────────────
+      # 10. AnyKernel3 で フラッシュZIP を作成
+      # ─────────────────────────────────────────
+      - name: 📦 Package with AnyKernel3
+        run: |
+          # AnyKernel3 テンプレートをクローン
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git \
+            $HOME/anykernel3
+
+          # このリポジトリの anykernel.sh で上書き
+          cp $GITHUB_WORKSPACE/anykernel3/anykernel.sh \
+             $HOME/anykernel3/anykernel.sh
+
+          # カーネルイメージをコピー（存在するものを選択）
+          KERNEL_DIR=$HOME/kernel/bramble/out/arch/arm64/boot
+          if [ -f "$KERNEL_DIR/Image.lz4-dtb" ]; then
+            cp "$KERNEL_DIR/Image.lz4-dtb" $HOME/anykernel3/
+          elif [ -f "$KERNEL_DIR/Image.lz4" ]; then
+            cp "$KERNEL_DIR/Image.lz4" $HOME/anykernel3/
+          elif [ -f "$KERNEL_DIR/Image" ]; then
+            cp "$KERNEL_DIR/Image" $HOME/anykernel3/
+          fi
+
+          # dtbo.img もコピー（存在する場合）
+          [ -f "$KERNEL_DIR/dtbo.img" ] && \
+            cp "$KERNEL_DIR/dtbo.img" $HOME/anykernel3/
+
+          # ZIP作成
+          ZIPNAME="KernelSU-Next-bramble-lineage23.2-$(date +%Y%m%d%H%M).zip"
+          cd $HOME/anykernel3
+          zip -r9 $HOME/$ZIPNAME * \
+            -x .git README.md '*.DS_Store'
+          echo "ZIPNAME=$ZIPNAME" >> $GITHUB_ENV
+          echo "ZIPPATH=$HOME/$ZIPNAME" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────
+      # 11. アーティファクトとしてアップロード
+      # ─────────────────────────────────────────
+      - name: 📤 Upload Kernel Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KernelSU-Next-bramble-${{ github.run_number }}
+          path: |
+            ${{ env.ZIPPATH }}
+            ~/build.log
+          retention-days: 30
+
+      # ─────────────────────────────────────────
+      # 12. (オプション) GitHubリリースとして公開
+      # ─────────────────────────────────────────
+      - name: 🚀 Create GitHub Release
+        if: ${{ inputs.release == true }}
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: ${{ env.ZIPPATH }}
+          name: "KernelSU Next - bramble (LineageOS 23.2)"
+          tag: "build-${{ github.run_number }}"
+          body: |
+            ## KernelSU Next Custom Kernel
+            - **Device**: Google Pixel 4a 5G (bramble)
+            - **Base**: LineageOS 23.2 (lineage-23.2)
+            - **Kernel**: Linux 4.19 (Non-GKI)
+            - **Root**: KernelSU Next (Manual Hook)
+            - **Build**: #${{ github.run_number }}
+            - **Date**: ${{ github.event.head_commit.timestamp }}
+          token: ${{ secrets.GITHUB_TOKEN }}
